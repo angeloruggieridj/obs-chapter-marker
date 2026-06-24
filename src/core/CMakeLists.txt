@@ -2,6 +2,8 @@ add_library(chapter-marker-core STATIC
   ChapterName.cpp
   RecordingClock.cpp
   TimeFormat.cpp
+  Timecode.cpp
+  Export.cpp
   Version.cpp
 )
 target_include_directories(chapter-marker-core

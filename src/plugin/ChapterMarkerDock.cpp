@@ -1,6 +1,7 @@
 #include "ChapterMarkerDock.hpp"
 #include "ChapterName.hpp"
 #include "TimeFormat.hpp"
+#include "Export.hpp"
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -14,9 +15,18 @@
 #include <QWidget>
 #include <QMainWindow>
 #include <QStatusBar>
+#include <QMenu>
+#include <QAction>
+#include <QFileDialog>
+#include <QFile>
+#include <QFileInfo>
+#include <QTextStream>
+#include <QStringConverter>
+#include <QPoint>
 #include <QDateTime>
 #include <QMetaObject>
 #include <chrono>
+#include <vector>
 
 #ifndef OCM_VERSION
 #define OCM_VERSION "0.0.0"
@@ -81,6 +91,11 @@ void ChapterMarkerDock::buildUi() {
     log_ = new QListWidget(root);
     layout->addWidget(log_, 1);
 
+    // Export.
+    exportButton_ = new QPushButton(obs_module_text("Export.Button"), root);
+    connect(exportButton_, &QPushButton::clicked, this, &ChapterMarkerDock::onExport);
+    layout->addWidget(exportButton_);
+
     // Status line.
     status_ = new QLabel(root);
     status_->setWordWrap(true);
@@ -98,10 +113,19 @@ QString ChapterMarkerDock::nextAutoName() const {
     return QString::fromStdString(ocm::resolveChapterName("", counter_));
 }
 
+double ChapterMarkerDock::currentFps() const {
+    obs_video_info ovi;
+    if (obs_get_video_info(&ovi) && ovi.fps_den > 0)
+        return static_cast<double>(ovi.fps_num) / static_cast<double>(ovi.fps_den);
+    return 30.0;
+}
+
 void ChapterMarkerDock::setRecording(bool active) {
     if (active && !recording_) {
         clock_.start(nowMs());
-        counter_ = 1; // restart auto numbering for the new recording
+        counter_ = 1;       // restart auto numbering for the new recording
+        markers_.clear();   // markers belong to a single recording session
+        log_->clear();
         nameEdit_->setPlaceholderText(nextAutoName());
     } else if (!active && recording_) {
         clock_.stop();
@@ -121,18 +145,24 @@ void ChapterMarkerDock::setPaused(bool paused) {
 
 void ChapterMarkerDock::updateButtonState() {
     addButton_->setEnabled(recording_);
-    if (!recording_) {
-        setStatus(obs_module_text("Status.NotRecording"));
-    } else if (paused_) {
-        setStatus(obs_module_text("Status.Paused"));
-    } else if (status_->text().isEmpty()) {
-        setStatus(obs_module_text("Status.Ready"));
-    }
+    exportButton_->setEnabled(!markers_.empty());
+    refreshStateStatus();
+}
+
+// Always reflect the current recording state on the status line (neutral
+// colour). Called on every state transition so the label never goes stale.
+void ChapterMarkerDock::refreshStateStatus() {
+    if (!recording_)
+        setStatus(obs_module_text("Status.NotRecording"), Status::Neutral);
+    else if (paused_)
+        setStatus(obs_module_text("Status.Paused"), Status::Neutral);
+    else
+        setStatus(obs_module_text("Status.Ready"), Status::Neutral);
 }
 
 void ChapterMarkerDock::onAddChapter() {
     if (!recording_) {
-        setStatus(obs_module_text("Status.NotRecording"), true);
+        setStatus(obs_module_text("Status.NotRecording"), Status::Error);
         return;
     }
 
@@ -140,43 +170,119 @@ void ChapterMarkerDock::onAddChapter() {
         ocm::resolveChapterName(nameEdit_->text().toStdString(), counter_);
 
     if (!obs_frontend_recording_add_chapter(name.c_str())) {
-        setStatus(obs_module_text("Status.AddFailed"), true);
+        setStatus(obs_module_text("Status.AddFailed"), Status::Error);
         showStatusBarMessage(obs_module_text("Status.AddFailed"));
         return;
     }
 
-    const QString elapsed = QString::fromStdString(ocm::formatHms(clock_.elapsedMs(nowMs())));
+    const long long elapsedMs = clock_.elapsedMs(nowMs());
+    const QString elapsed = QString::fromStdString(ocm::formatHms(elapsedMs));
     const QString wall = QDateTime::currentDateTime().toString("HH:mm:ss");
     const QString qname = QString::fromStdString(name);
 
+    markers_.push_back({qname, elapsedMs, wall});
     log_->addItem(QString("%1 — %2 (%3)").arg(qname, elapsed, wall));
     log_->scrollToBottom();
 
     ++counter_;
     nameEdit_->clear();
     nameEdit_->setPlaceholderText(nextAutoName());
+    exportButton_->setEnabled(true);
 
     const QString confirm =
         QString(obs_module_text("Status.Added")).arg(qname).arg(elapsed);
-    setStatus(confirm);
+    setStatus(confirm, Status::Success);
     showStatusBarMessage(confirm);
 
     blog(LOG_INFO, "[obs-chapter-marker] chapter added: \"%s\" @ %s",
          name.c_str(), elapsed.toUtf8().constData());
 }
 
-void ChapterMarkerDock::setStatus(const QString& msg, bool error) {
+void ChapterMarkerDock::onExport() {
+    if (markers_.empty()) return;
+    QMenu menu(this);
+    connect(menu.addAction(obs_module_text("Export.YouTube")), &QAction::triggered,
+            this, [this] { exportTo("youtube"); });
+    connect(menu.addAction(obs_module_text("Export.Resolve")), &QAction::triggered,
+            this, [this] { exportTo("edl"); });
+    connect(menu.addAction(obs_module_text("Export.Premiere")), &QAction::triggered,
+            this, [this] { exportTo("premiere"); });
+    connect(menu.addAction(obs_module_text("Export.FinalCut")), &QAction::triggered,
+            this, [this] { exportTo("fcpxml"); });
+    menu.exec(exportButton_->mapToGlobal(QPoint(0, exportButton_->height())));
+}
+
+void ChapterMarkerDock::exportTo(const QString& format) {
+    if (markers_.empty()) return;
+
+    std::vector<ocm::MarkerEntry> entries;
+    entries.reserve(markers_.size());
+    for (const auto& m : markers_)
+        entries.push_back({m.name.toStdString(), m.elapsedMs});
+
+    const double fps = currentFps();
+    std::string content;
+    QString defName, filter;
+    if (format == "youtube") {
+        content = ocm::exportYouTube(entries);
+        defName = "chapters.txt"; filter = "Text (*.txt)";
+    } else if (format == "edl") {
+        content = ocm::exportEdl(entries, fps);
+        defName = "markers.edl"; filter = "EDL (*.edl)";
+    } else if (format == "premiere") {
+        content = ocm::exportPremiereCsv(entries, fps);
+        defName = "markers.csv"; filter = "CSV (*.csv)";
+    } else { // fcpxml
+        content = ocm::exportFcpxml(entries, fps);
+        defName = "markers.fcpxml"; filter = "FCPXML (*.fcpxml)";
+    }
+
+    const QString path = QFileDialog::getSaveFileName(
+        this, obs_module_text("Export.Button"), defName, filter);
+    if (path.isEmpty()) return; // user cancelled
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        setStatus(obs_module_text("Export.Failed"), Status::Error);
+        showStatusBarMessage(obs_module_text("Export.Failed"));
+        return;
+    }
+    QTextStream out(&file);
+    out.setEncoding(QStringConverter::Utf8);
+    out << QString::fromStdString(content);
+    file.close();
+
+    const QString msg =
+        QString(obs_module_text("Export.Done")).arg(QFileInfo(path).fileName());
+    setStatus(msg, Status::Success);
+    showStatusBarMessage(msg);
+    blog(LOG_INFO, "[obs-chapter-marker] exported %d markers to %s",
+         static_cast<int>(markers_.size()), path.toUtf8().constData());
+}
+
+void ChapterMarkerDock::setStatus(const QString& msg, Status level) {
     if (!status_) return;
     status_->setText(msg);
-    status_->setStyleSheet(error ? "color: #d9534f;" : "color: #5cb85c;");
+    switch (level) {
+    case Status::Success: status_->setStyleSheet("color: #5cb85c;"); break;
+    case Status::Error:   status_->setStyleSheet("color: #d9534f;"); break;
+    case Status::Neutral: default: status_->setStyleSheet(QString()); break;
+    }
 }
 
 void ChapterMarkerDock::showStatusBarMessage(const QString& msg) {
-    // Mirror the replay-buffer UX: a transient message in OBS's bottom-left
-    // status bar. Fall back silently to the dock status line if the main window
-    // is unavailable or not a QMainWindow.
+    // Mirror OBS's own OBSBasic::ShowStatusBarMessage: target the real, visible
+    // status bar (OBSBasicStatusBar) found among the main window's children —
+    // QMainWindow::statusBar() may return a phantom empty bar that is never
+    // shown. Fall back to the dock status line if the bar is unavailable.
     auto* mw = static_cast<QMainWindow*>(obs_frontend_get_main_window());
-    if (mw && mw->statusBar()) mw->statusBar()->showMessage(msg, 4000);
+    if (!mw) return;
+    QStatusBar* sb = mw->findChild<QStatusBar*>();
+    if (!sb) sb = mw->statusBar();
+    if (sb) {
+        sb->clearMessage();
+        sb->showMessage(msg, 10000);
+    }
 }
 
 // ---- hotkey --------------------------------------------------------------

@@ -15,6 +15,9 @@ plus a bottom-left status message confirming the action):
 - ✅ **Visible confirmation** — a message in OBS's bottom-left status bar *and* a
   status line inside the dock.
 - ⌨️ **Own hotkey** — bindable in *Settings → Hotkeys* (“Add Chapter Marker”).
+- 📤 **Export** the session markers to formats each editor imports natively:
+  **YouTube** chapters (`.txt`), **DaVinci Resolve** (`.edl`), **Premiere Pro**
+  (`.csv`) and **Final Cut Pro** (`.fcpxml`).
 
 > The plugin triggers OBS's built-in chapter API, so markers land in your
 > recording exactly as if you had used the native hotkey — you just finally get
@@ -50,6 +53,21 @@ Restart OBS, then enable the dock from **Docks → Chapter Marker**.
 
 Bind a hotkey under **Settings → Hotkeys → Add Chapter Marker** for hands-free
 marking.
+
+### Exporting markers
+
+Click **Export…** and choose a target:
+
+| Target | File | Import in the editor |
+| --- | --- | --- |
+| YouTube | `.txt` | Paste the lines into the video description. |
+| DaVinci Resolve | `.edl` | Timeline → *Import → Timeline Markers from EDL*. |
+| Premiere Pro | `.csv` | Markers panel → *Import Markers from CSV*. |
+| Final Cut Pro | `.fcpxml` | *File → Import → XML*. |
+
+Timecodes use the current OBS output frame rate. Drop-frame rates (29.97, 59.94)
+are written as non-drop in this version, so timecodes may differ by a few frames
+from a drop-frame timeline over long recordings.
 
 ## Building from source
 

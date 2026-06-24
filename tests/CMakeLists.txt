@@ -4,6 +4,8 @@ add_executable(chapter-marker-tests
   test_chaptername.cpp
   test_recordingclock.cpp
   test_timeformat.cpp
+  test_timecode.cpp
+  test_export.cpp
   test_version.cpp
 )
 target_link_libraries(chapter-marker-tests PRIVATE chapter-marker-core)
