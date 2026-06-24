@@ -76,14 +76,17 @@ exact per-platform invocations.
 src/core      Pure, unit-tested logic (naming, recording clock, formatting)
 src/plugin    OBS + Qt: dock widget, hotkey, frontend events
 tests         doctest suites over src/core
-data/locale   Translations (en-US, it-IT)
+data/locale   Translations (10 languages)
 docs          Design spec and implementation plan
 ```
 
 ## Localization
 
-Shipped in English (`en-US`) and Italian (`it-IT`). To add a language, copy
-`data/locale/en-US.ini` to your locale code and translate the values.
+Shipped in 10 languages: English (`en-US`), Italian (`it-IT`), German (`de-DE`),
+Spanish (`es-ES`), French (`fr-FR`), Japanese (`ja-JP`), Korean (`ko-KR`),
+Brazilian Portuguese (`pt-BR`), Russian (`ru-RU`) and Simplified Chinese
+(`zh-CN`). To add a language, copy `data/locale/en-US.ini` to your locale code
+and translate the values.
 
 ## License
 
