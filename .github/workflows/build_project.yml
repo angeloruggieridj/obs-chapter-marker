@@ -1,0 +1,435 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # weekly (Mon 06:00 UTC) — exercises the compat matrix
+
+permissions:
+  contents: write
+
+env:
+  OBS_VERSION: "32.1.2"
+  OBS_DEPS_VERSION: "2025-08-23"
+
+jobs:
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - run: cmake -B build -S . -G Ninja -DBUILD_PLUGIN=OFF -DBUILD_TESTS=ON
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  linux:
+    name: Linux x86_64
+    needs: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config extra-cmake-modules \
+            qt6-base-dev qt6-base-private-dev qt6-svg-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+            libavfilter-dev libswscale-dev libswresample-dev libx264-dev \
+            libcurl4-openssl-dev libjansson-dev libmbedtls-dev libsimde-dev \
+            uthash-dev nlohmann-json3-dev zlib1g-dev libpng-dev \
+            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev \
+            libgles2-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-xinerama0-dev libxcb-randr0-dev libxcb-shm0-dev \
+            libxcb-xfixes0-dev libxcb-composite0-dev libxcb-xinput-dev \
+            libxfixes-dev libxcomposite-dev libxinerama-dev libxss-dev \
+            libdrm-dev libva-dev libxcb-cursor-dev \
+            libqrcodegencpp-dev librist-dev libsrt-openssl-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libpci-dev libpulse-dev libudev-dev libasound2-dev
+      # OBS dev libs (obs-frontend-api) built from source, pinned to OBS_VERSION,
+      # because distro libobs predates obs_frontend_recording_add_chapter (30.2+).
+      - name: Cache OBS dev
+        id: cache-obsdev
+        uses: actions/cache@v5
+        with:
+          path: /tmp/obs-dev
+          key: obsdev-linux-${{ env.OBS_VERSION }}-v1
+      - name: Build OBS dev
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch ${{ env.OBS_VERSION }} \
+            https://github.com/obsproject/obs-studio.git /tmp/obs
+          # OBS 32.2's Linux helper calls add_dependencies(obs-studio <execs> <mods>)
+          # which errors when plugins/executables are disabled (empty lists).
+          sed -i 's|add_dependencies(${target} ${obs_executables} ${obs_modules})|if(obs_executables OR obs_modules)\n      add_dependencies(${target} ${obs_executables} ${obs_modules})\n    endif()|' /tmp/obs/cmake/linux/helpers.cmake || true
+          cmake -B /tmp/obs-build -S /tmp/obs -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+            -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF \
+            -DENABLE_BROWSER=OFF -DENABLE_VLC=OFF
+          cmake --build /tmp/obs-build --target obs-frontend-api --parallel
+          cmake --install /tmp/obs-build --component Development --prefix /tmp/obs-dev
+      - name: Configure
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF -DCMAKE_PREFIX_PATH="/tmp/obs-dev;/usr"
+      - name: Build
+        run: cmake --build build
+      - name: Install
+        run: DESTDIR="${{ github.workspace }}/release" cmake --install build
+      - name: Package
+        run: tar -czf obs-chapter-marker-linux-x86_64.tar.gz -C "${{ github.workspace }}/release" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs-chapter-marker-linux
+          path: obs-chapter-marker-linux-x86_64.tar.gz
+
+  windows:
+    name: Windows x64
+    needs: tests
+    runs-on: windows-2022
+    env:
+      QT_WIN_VERSION: "6.7.3"
+      QT_WIN_ARCH: "win64_msvc2019_64"
+    steps:
+      - uses: actions/checkout@v6
+
+      # --- Qt (cached) ---
+      - name: Cache Qt
+        id: cache-qt
+        uses: actions/cache@v5
+        with:
+          path: C:\Qt
+          key: qt-${{ env.QT_WIN_VERSION }}-${{ env.QT_WIN_ARCH }}-v1
+      - name: Install Qt6
+        if: steps.cache-qt.outputs.cache-hit != 'true'
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "aqtinstall==3.1.*" "py7zr<1.0"
+          python -m aqt install-qt windows desktop ${{ env.QT_WIN_VERSION }} ${{ env.QT_WIN_ARCH }} -O C:\Qt
+      - name: Qt environment
+        shell: powershell
+        run: |
+          "Qt6_DIR=C:\Qt\${{ env.QT_WIN_VERSION }}\msvc2019_64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\Qt\${{ env.QT_WIN_VERSION }}\msvc2019_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # --- OBS prebuilt deps (cached) ---
+      - name: Cache obs-deps
+        id: cache-deps
+        uses: actions/cache@v5
+        with:
+          path: C:\obs-deps
+          key: obsdeps-win-x64-v1
+      - name: Download OBS pre-built deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path C:\deps-raw -Force
+          New-Item -ItemType Directory -Path C:\obs-deps -Force
+          gh release download --repo obsproject/obs-deps --pattern "windows-deps-[0-9]*-x64*.zip" --dir C:\deps-raw
+          $zip = (Get-ChildItem "C:\deps-raw" -Filter "*.zip" | Select-Object -First 1).FullName
+          Expand-Archive $zip -DestinationPath C:\obs-deps-extract
+          $top = Get-ChildItem "C:\obs-deps-extract"
+          if ($top.Count -eq 1 -and $top[0].PSIsContainer) {
+            Get-ChildItem $top[0].FullName | Move-Item -Destination C:\obs-deps
+          } else {
+            $top | Move-Item -Destination C:\obs-deps
+          }
+
+      # --- OBS dev libs (cached per OBS version) ---
+      - name: Cache OBS dev
+        id: cache-obsdev
+        uses: actions/cache@v5
+        with:
+          path: C:\obs-dev
+          key: obsdev-win-${{ env.OBS_VERSION }}-v1
+      - name: Download OBS source
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          curl -L "https://github.com/obsproject/obs-studio/archive/refs/tags/%OBS_VERSION%.zip" -o obs.zip
+          tar -xf obs.zip -C C:\
+      - name: Configure OBS
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          cmake -B C:\obs-build -S "C:\obs-studio-${{ env.OBS_VERSION }}" -A x64 ^
+            -DENABLE_PLUGINS=OFF ^
+            -DENABLE_SCRIPTING=OFF ^
+            -DENABLE_BROWSER=OFF ^
+            -DENABLE_UPDATER=OFF ^
+            -DCMAKE_SYSTEM_VERSION=10.0 ^
+            -DDepsPath="C:\obs-deps" ^
+            -DFFMPEG_PATH="C:\obs-deps" ^
+            -DQTDIR="%Qt6_DIR%" ^
+            -DCMAKE_PREFIX_PATH="C:\obs-deps;%Qt6_DIR%"
+      - name: Build OBS
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: cmake --build C:\obs-build --target obs-frontend-api --config Release --parallel
+      - name: Install OBS dev
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: cmake --install C:\obs-build --config Release --component Development --prefix C:\obs-dev
+      - name: Configure plugin
+        shell: cmd
+        run: |
+          cmake -B build -S . -A x64 ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DBUILD_TESTS=OFF ^
+            -DCMAKE_PREFIX_PATH="C:\obs-dev;%Qt6_DIR%;C:\obs-deps"
+      - name: Build plugin
+        run: cmake --build build --config Release
+      - name: Install plugin
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}\release"
+      - name: Package (per-user layout for %APPDATA%\obs-studio\plugins)
+        shell: powershell
+        run: |
+          $ws = "${{ github.workspace }}"
+          $dst = "$ws\pkg\obs-chapter-marker"
+          New-Item -ItemType Directory -Force -Path "$dst\bin\64bit" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dst\data" | Out-Null
+          Copy-Item "$ws\release\obs-plugins\64bit\*" "$dst\bin\64bit\" -Recurse -Force
+          Copy-Item "$ws\release\data\obs-plugins\obs-chapter-marker\*" "$dst\data\" -Recurse -Force
+          Compress-Archive -Path "$dst" -DestinationPath "$ws\obs-chapter-marker-windows.zip" -Force
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs-chapter-marker-windows
+          path: obs-chapter-marker-windows.zip
+
+  macos:
+    name: macOS universal
+    needs: tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: brew install cmake ninja
+
+      # --- OBS prebuilt universal deps (cached) ---
+      - name: Cache obs-deps
+        id: cache-deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            /tmp/obs-deps
+            /tmp/obs-deps-qt6
+          key: obsdeps-mac-universal-${{ env.OBS_DEPS_VERSION }}-v1
+      - name: Download universal OBS pre-built deps
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/obs-deps /tmp/obs-deps-qt6
+          curl -fsSL \
+            "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/macos-deps-${{ env.OBS_DEPS_VERSION }}-universal.tar.xz" \
+            | tar -xJ -C /tmp/obs-deps
+          curl -fsSL \
+            "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/macos-deps-qt6-${{ env.OBS_DEPS_VERSION }}-universal.tar.xz" \
+            | tar -xJ -C /tmp/obs-deps-qt6
+
+      # --- OBS dev libs (universal, cached per OBS version) ---
+      - name: Cache OBS dev
+        id: cache-obsdev
+        uses: actions/cache@v5
+        with:
+          path: /tmp/obs-dev
+          key: obsdev-mac-universal-${{ env.OBS_VERSION }}-v1
+      - name: Clone OBS source
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch ${{ env.OBS_VERSION }} \
+            https://github.com/obsproject/obs-studio.git /tmp/obs
+          # libobs-metal is a Swift-only target and OBS never enables the Swift
+          # language, which breaks CMake generate. It is a runtime graphics module
+          # nothing here links, so drop it; we only need obs-frontend-api dev files.
+          sed -i.bak 's/^\( *\)add_subdirectory(libobs-metal)/\1# disabled for dev build: add_subdirectory(libobs-metal)/' /tmp/obs/CMakeLists.txt
+      - name: Configure OBS (universal)
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: |
+          cmake -B /tmp/obs-build -S /tmp/obs \
+            -G Xcode \
+            -DENABLE_PLUGINS=OFF \
+            -DENABLE_SCRIPTING=OFF \
+            -DENABLE_BROWSER=OFF \
+            -DENABLE_VLC=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DCMAKE_PREFIX_PATH="/tmp/obs-deps-qt6;/tmp/obs-deps"
+      - name: Build OBS
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: cmake --build /tmp/obs-build --target obs-frontend-api --config Release --parallel
+      - name: Install OBS dev
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: cmake --install /tmp/obs-build --config Release --component Development --prefix /tmp/obs-dev
+      - name: Configure plugin (universal)
+        run: |
+          cmake -B build -S . \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -Dlibobs_DIR="/tmp/obs-dev/Frameworks/libobs.framework/Resources/cmake" \
+            -Dobs-frontend-api_DIR="/tmp/obs-dev/lib/cmake/obs-frontend-api" \
+            -DQt6_DIR="/tmp/obs-deps-qt6/lib/cmake/Qt6" \
+            -DCMAKE_PREFIX_PATH="/tmp/obs-dev;/tmp/obs-deps-qt6;/tmp/obs-deps"
+      - name: Build plugin
+        run: cmake --build build
+      - name: Install plugin
+        run: DESTDIR="${{ github.workspace }}/release" cmake --install build
+      - name: Package .plugin (universal, @rpath Qt)
+        run: |
+          bundle="macos-package/obs-chapter-marker.plugin"
+          mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+
+          binary_src="$(find "${{ github.workspace }}/release" -type f -name 'libobs-chapter-marker.*' -print -quit)"
+          data_dir="$(find "${{ github.workspace }}/release" -type d -path '*/obs-chapter-marker' -print -quit)"
+
+          if [ -z "$binary_src" ]; then
+            echo "Could not find the built macOS plugin binary"
+            find "${{ github.workspace }}/release" -maxdepth 6 -type f -print
+            exit 1
+          fi
+
+          cp "$binary_src" "$bundle/Contents/MacOS/obs-chapter-marker"
+          [ -n "$data_dir" ] && cp -R "$data_dir"/. "$bundle/Contents/Resources/"
+          chmod +x "$bundle/Contents/MacOS/obs-chapter-marker"
+          binary="$bundle/Contents/MacOS/obs-chapter-marker"
+
+          cat > "$bundle/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>obs-chapter-marker</string>
+            <key>CFBundleIdentifier</key><string>com.angeloruggieridj.obs-chapter-marker</string>
+            <key>CFBundleName</key><string>Chapter Marker</string>
+            <key>CFBundlePackageType</key><string>BNDL</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundleVersion</key><string>1.0.0</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          printf 'BNDL????' > "$bundle/Contents/PkgInfo"
+
+          # Rewrite absolute Qt install names to @rpath so the plugin resolves Qt
+          # from OBS.app's bundled frameworks on any machine.
+          otool -L "$binary" | awk 'NR>1{print $1}' \
+            | grep -E '/Qt[A-Za-z]+\.framework/' \
+            | grep -v '^@rpath/' \
+            | while read -r dep; do
+                new="$(printf '%s' "$dep" | sed -E 's#^.*/(Qt[A-Za-z]+\.framework/.*)$#@rpath/\1#')"
+                echo "Rewriting $dep -> $new"
+                install_name_tool -change "$dep" "$new" "$binary"
+              done
+
+          if otool -L "$binary" | awk 'NR>1{print $1}' \
+               | grep -E '^(/tmp/|/opt/homebrew/|/usr/local/)'; then
+            echo "Absolute build-machine install names leaked into the macOS plugin bundle"
+            exit 1
+          fi
+
+          archs="$(lipo -archs "$binary")"
+          echo "binary archs: $archs"
+          echo "$archs" | grep -q x86_64 && echo "$archs" | grep -q arm64 \
+            || { echo "binary is not universal (x86_64 + arm64)"; exit 1; }
+
+          codesign --force --sign - "$binary"
+          codesign --force --deep --sign - "$bundle"
+
+          tar -czf obs-chapter-marker-macos-universal.tar.gz -C macos-package obs-chapter-marker.plugin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs-chapter-marker-macos
+          path: obs-chapter-marker-macos-universal.tar.gz
+
+  # Best-effort compatibility check: does the plugin compile against older OBS
+  # SDKs? Informational only (continue-on-error) and not a release gate.
+  compat:
+    name: OBS compat ${{ matrix.obs }}
+    needs: tests
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # 30.2.0 is the minimum that ships obs_frontend_recording_add_chapter;
+        # 32.2.0-beta2 verifies forward compatibility with the upcoming line.
+        obs: ["30.2.0", "32.2.0-beta2"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config extra-cmake-modules \
+            qt6-base-dev qt6-base-private-dev qt6-svg-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev \
+            libavfilter-dev libswscale-dev libswresample-dev libx264-dev \
+            libcurl4-openssl-dev libjansson-dev libmbedtls-dev libsimde-dev \
+            uthash-dev nlohmann-json3-dev zlib1g-dev libpng-dev \
+            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libgl1-mesa-dev \
+            libgles2-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-xinerama0-dev libxcb-randr0-dev libxcb-shm0-dev \
+            libxcb-xfixes0-dev libxcb-composite0-dev libxcb-xinput-dev \
+            libxfixes-dev libxcomposite-dev libxinerama-dev libxss-dev \
+            libdrm-dev libva-dev libxcb-cursor-dev \
+            libqrcodegencpp-dev librist-dev libsrt-openssl-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libpci-dev libpulse-dev libudev-dev libasound2-dev
+      - name: Cache OBS dev
+        id: cache-obsdev
+        uses: actions/cache@v5
+        with:
+          path: /tmp/obs-dev
+          key: obsdev-linux-${{ matrix.obs }}-v1
+      - name: Build OBS dev (${{ matrix.obs }})
+        if: steps.cache-obsdev.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch ${{ matrix.obs }} \
+            https://github.com/obsproject/obs-studio.git /tmp/obs
+          sed -i 's|add_dependencies(${target} ${obs_executables} ${obs_modules})|if(obs_executables OR obs_modules)\n      add_dependencies(${target} ${obs_executables} ${obs_modules})\n    endif()|' /tmp/obs/cmake/linux/helpers.cmake || true
+          cmake -B /tmp/obs-build -S /tmp/obs -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+            -DENABLE_PLUGINS=OFF -DENABLE_SCRIPTING=OFF \
+            -DENABLE_BROWSER=OFF -DENABLE_VLC=OFF
+          cmake --build /tmp/obs-build --target obs-frontend-api --parallel
+          cmake --install /tmp/obs-build --component Development --prefix /tmp/obs-dev
+      - name: Configure + build plugin against OBS ${{ matrix.obs }}
+        run: |
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF \
+            -DCMAKE_PREFIX_PATH="/tmp/obs-dev;/usr"
+          cmake --build build
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - tests
+      - linux
+      - windows
+      - macos
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            release-assets/obs-chapter-marker-linux-x86_64.tar.gz
+            release-assets/obs-chapter-marker-windows.zip
+            release-assets/obs-chapter-marker-macos-universal.tar.gz
