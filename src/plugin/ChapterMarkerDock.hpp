@@ -1,5 +1,5 @@
 #pragma once
-#include <QDockWidget>
+#include <QWidget>
 #include <QString>
 #include <vector>
 #include <obs.h>
@@ -10,11 +10,12 @@ class QPushButton;
 class QListWidget;
 class QLabel;
 
-// Dock that exposes OBS's built-in recording chapter markers: an "Add Chapter
-// Marker" button, custom/auto naming, a session log, recording-state awareness,
-// visible confirmation (OBS status bar + in-dock status line), and export of the
-// session markers to NLE-native formats.
-class ChapterMarkerDock : public QDockWidget {
+// Dock content exposing OBS's built-in recording chapter markers: an "Add
+// Chapter Marker" button, custom/auto naming, a session log, recording-state
+// awareness, visible confirmation (OBS status bar + in-dock status line), and
+// export of the session markers to NLE-native formats. Registered with OBS via
+// obs_frontend_add_dock_by_id, which wraps this plain widget in its own dock.
+class ChapterMarkerDock : public QWidget {
     Q_OBJECT
 public:
     explicit ChapterMarkerDock(QWidget* parent = nullptr);

@@ -20,7 +20,10 @@ static void on_frontend_event(enum obs_frontend_event event, void*) {
     case OBS_FRONTEND_EVENT_FINISHED_LOADING: {
         auto* mw = static_cast<QMainWindow*>(obs_frontend_get_main_window());
         g_dock = new ChapterMarkerDock(mw);
-        obs_frontend_add_custom_qdock(DOCK_ID, g_dock);
+        // add_dock_by_id wraps our plain QWidget in OBS's own dock, avoiding the
+        // "must be a top level window" warning from registering a bare
+        // QDockWidget.
+        obs_frontend_add_dock_by_id(DOCK_ID, obs_module_text("ChapterMarker"), g_dock);
         blog(LOG_INFO, "[obs-chapter-marker] dock registered");
         break;
     }

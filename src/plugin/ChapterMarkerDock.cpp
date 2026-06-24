@@ -13,6 +13,7 @@
 #include <QListWidget>
 #include <QLabel>
 #include <QWidget>
+#include <QVariant>
 #include <QMainWindow>
 #include <QStatusBar>
 #include <QMenu>
@@ -39,9 +40,8 @@ int64_t nowMs() {
 }
 } // namespace
 
-ChapterMarkerDock::ChapterMarkerDock(QWidget* parent) : QDockWidget(parent) {
+ChapterMarkerDock::ChapterMarkerDock(QWidget* parent) : QWidget(parent) {
     setObjectName("ObsChapterMarkerDock");
-    setWindowTitle(obs_module_text("ChapterMarker"));
     buildUi();
     registerHotkeys();
 
@@ -65,48 +65,45 @@ void ChapterMarkerDock::shutdown() {
 }
 
 void ChapterMarkerDock::buildUi() {
-    auto* root = new QWidget(this);
-    auto* layout = new QVBoxLayout(root);
+    auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(6);
 
     // Name row.
     auto* nameRow = new QHBoxLayout();
-    auto* nameLabel = new QLabel(obs_module_text("Name.Label"), root);
-    nameEdit_ = new QLineEdit(root);
+    auto* nameLabel = new QLabel(obs_module_text("Name.Label"), this);
+    nameEdit_ = new QLineEdit(this);
     nameEdit_->setPlaceholderText(nextAutoName());
     nameRow->addWidget(nameLabel);
     nameRow->addWidget(nameEdit_, 1);
     layout->addLayout(nameRow);
 
     // Add button.
-    addButton_ = new QPushButton(obs_module_text("Add.Button"), root);
+    addButton_ = new QPushButton(obs_module_text("Add.Button"), this);
     addButton_->setMinimumHeight(36);
     connect(addButton_, &QPushButton::clicked, this, &ChapterMarkerDock::onAddChapter);
     connect(nameEdit_, &QLineEdit::returnPressed, this, &ChapterMarkerDock::onAddChapter);
     layout->addWidget(addButton_);
 
     // Session log.
-    layout->addWidget(new QLabel(obs_module_text("Log.Label"), root));
-    log_ = new QListWidget(root);
+    layout->addWidget(new QLabel(obs_module_text("Log.Label"), this));
+    log_ = new QListWidget(this);
     layout->addWidget(log_, 1);
 
     // Export.
-    exportButton_ = new QPushButton(obs_module_text("Export.Button"), root);
+    exportButton_ = new QPushButton(obs_module_text("Export.Button"), this);
     connect(exportButton_, &QPushButton::clicked, this, &ChapterMarkerDock::onExport);
     layout->addWidget(exportButton_);
 
     // Status line.
-    status_ = new QLabel(root);
+    status_ = new QLabel(this);
     status_->setWordWrap(true);
     layout->addWidget(status_);
 
-    versionLabel_ = new QLabel(QString("v%1").arg(OCM_VERSION), root);
+    versionLabel_ = new QLabel(QString("v%1").arg(OCM_VERSION), this);
     versionLabel_->setStyleSheet("color: gray; font-size: 10px;");
     versionLabel_->setAlignment(Qt::AlignRight);
     layout->addWidget(versionLabel_);
-
-    setWidget(root);
 }
 
 QString ChapterMarkerDock::nextAutoName() const {
@@ -271,16 +268,19 @@ void ChapterMarkerDock::setStatus(const QString& msg, Status level) {
 }
 
 void ChapterMarkerDock::showStatusBarMessage(const QString& msg) {
-    // Mirror OBS's own OBSBasic::ShowStatusBarMessage: target the real, visible
-    // status bar (OBSBasicStatusBar) found among the main window's children —
-    // QMainWindow::statusBar() may return a phantom empty bar that is never
-    // shown. Fall back to the dock status line if the bar is unavailable.
+    // OBS's status bar is OBSBasicStatusBar, which OVERRIDES showMessage (a
+    // non-virtual QStatusBar method) to render into its own message label; the
+    // base QStatusBar message area is collapsed to zero width by a permanent
+    // widget, so a plain QStatusBar::showMessage call is invisible. Invoke the
+    // override dynamically through the meta-object so the real OBSBasicStatusBar
+    // slot runs. Falls back to the base call for a non-OBS QStatusBar.
     auto* mw = static_cast<QMainWindow*>(obs_frontend_get_main_window());
     if (!mw) return;
     QStatusBar* sb = mw->findChild<QStatusBar*>();
     if (!sb) sb = mw->statusBar();
-    if (sb) {
-        sb->clearMessage();
+    if (!sb) return;
+    if (!QMetaObject::invokeMethod(sb, "showMessage", Qt::DirectConnection,
+                                   Q_ARG(QString, msg), Q_ARG(int, 10000))) {
         sb->showMessage(msg, 10000);
     }
 }
